@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import atexit
+import http.client
 import os
+import re
 import socket
 import time
+import urllib.parse
+import uuid
 from pathlib import Path
 from typing import Final
 
+import ifaddr
 import qrcode
 from flask import (
     Flask,
@@ -17,28 +23,93 @@ from flask import (
     send_from_directory,
 )
 from werkzeug.utils import secure_filename
+from zeroconf import InterfaceChoice, ServiceBrowser, ServiceInfo, Zeroconf
 
 APP_HOST: Final[str] = "0.0.0.0"
 APP_PORT: Final[int] = 8080
 UPLOAD_DIR: Final[Path] = Path("uploads")
 QR_PATH: Final[Path] = Path("server_qr.png")
+SERVICE_TYPE: Final[str] = "_lanshare._tcp.local."
+
+# Unique id for this running instance, so we can ignore ourselves while browsing.
+INSTANCE_ID: Final[str] = uuid.uuid4().hex[:12]
 
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+def get_device_name() -> str:
+    """Friendly, human-readable name for this device (overridable via env)."""
+    name = os.environ.get("LANSHARE_NAME", "").strip()
+    if name:
+        return name
+    return socket.gethostname() or "LanShare device"
+
+
+DEVICE_NAME: Final[str] = get_device_name()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024 * 1024  # 50 GB
 
 
-def get_local_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
+# --------------------------------------------------------------------------- #
+# Networking: interface enumeration that works on wired / air-gapped links     #
+# --------------------------------------------------------------------------- #
+
+
+def get_all_ipv4() -> list[str]:
+    """Every usable IPv4 on this machine, across all interfaces.
+
+    Unlike the old ``connect(("8.8.8.8", 80))`` trick, this needs no internet,
+    so it works on a direct Ethernet cable between two devices, including
+    auto-assigned link-local (APIPA, 169.254.x.x) addresses.
+
+    Ordinary LAN addresses are returned first, link-local addresses last,
+    because a routed LAN IP is preferred when both exist.
+    """
+    normal: list[str] = []
+    link_local: list[str] = []
+    for adapter in ifaddr.get_adapters():
+        for ip in adapter.ips:
+            if not ip.is_IPv4:
+                continue
+            addr = ip.ip
+            if not isinstance(addr, str):
+                continue
+            if addr.startswith("127.") or addr == "0.0.0.0":
+                continue
+            if addr.startswith("169.254."):
+                link_local.append(addr)
+            else:
+                normal.append(addr)
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for addr in normal + link_local:
+        if addr not in seen:
+            seen.add(addr)
+            ordered.append(addr)
+    return ordered
+
+
+def get_primary_ip() -> str:
+    """Best single IP to show in the QR code / primary link."""
+    ips = get_all_ipv4()
+    return ips[0] if ips else "127.0.0.1"
+
+
+def access_urls() -> list[str]:
+    return [f"http://{ip}:{APP_PORT}" for ip in get_all_ipv4()]
+
+
+def mdns_hostname() -> str:
+    """Stable, typeable .local name for this device."""
+    safe = re.sub(r"[^a-zA-Z0-9-]", "-", DEVICE_NAME.lower()).strip("-") or "device"
+    return f"lanshare-{safe}.local"
+
+
+# --------------------------------------------------------------------------- #
+# File helpers                                                                 #
+# --------------------------------------------------------------------------- #
 
 
 def human_size(num: int) -> str:
@@ -75,13 +146,158 @@ def safe_join_uploads(filename: str) -> Path:
     return candidate
 
 
+def unique_target(filename: str) -> Path:
+    """Pick a non-colliding path inside UPLOAD_DIR for an incoming file."""
+    target = UPLOAD_DIR / filename
+    if target.exists():
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        target = UPLOAD_DIR / f"{target.stem}-{timestamp}{target.suffix}"
+    return target
+
+
+# --------------------------------------------------------------------------- #
+# Peer discovery via mDNS / zeroconf                                           #
+# --------------------------------------------------------------------------- #
+
+
+class PeerListener:
+    """Tracks other LanShare devices announced on the local network."""
+
+    def __init__(self) -> None:
+        self.peers: dict[str, dict] = {}
+
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        self._update(zc, type_, name)
+
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        self._update(zc, type_, name)
+
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        self.peers.pop(name, None)
+
+    def _update(self, zc: Zeroconf, type_: str, name: str) -> None:
+        info = zc.get_service_info(type_, name, timeout=2000)
+        if not info:
+            return
+        props = info.properties or {}
+        peer_id = props.get(b"id", b"").decode(errors="ignore")
+        # Ignore our own advertisement.
+        if peer_id == INSTANCE_ID:
+            self.peers.pop(name, None)
+            return
+        addresses = info.parsed_addresses()
+        if not addresses:
+            return
+        display = props.get(b"name", b"").decode(errors="ignore") or name.split(".")[0]
+        self.peers[name] = {
+            "id": peer_id,
+            "name": display,
+            "addresses": addresses,
+            "port": info.port,
+            "url": f"http://{addresses[0]}:{info.port}",
+        }
+
+    def snapshot(self) -> list[dict]:
+        return sorted(self.peers.values(), key=lambda p: p["name"].lower())
+
+
+_zeroconf: Zeroconf | None = None
+_peer_listener = PeerListener()
+
+
+def start_zeroconf() -> None:
+    """Advertise this device and start browsing for peers (incl. link-local)."""
+    global _zeroconf
+    ips = get_all_ipv4()
+    if not ips:
+        print("[mDNS] No usable network interfaces found; discovery disabled.")
+        return
+    try:
+        _zeroconf = Zeroconf(interfaces=InterfaceChoice.All)
+    except Exception as exc:  # pragma: no cover - platform dependent
+        print(f"[mDNS] Could not start zeroconf: {exc}")
+        return
+
+    info = ServiceInfo(
+        SERVICE_TYPE,
+        f"{DEVICE_NAME}-{INSTANCE_ID}.{SERVICE_TYPE}",
+        addresses=[socket.inet_aton(ip) for ip in ips],
+        port=APP_PORT,
+        properties={"id": INSTANCE_ID, "name": DEVICE_NAME},
+        server=f"{mdns_hostname()}.",
+    )
+    try:
+        _zeroconf.register_service(info, allow_name_change=True)
+    except Exception as exc:  # pragma: no cover - platform dependent
+        print(f"[mDNS] Could not register service: {exc}")
+
+    ServiceBrowser(_zeroconf, SERVICE_TYPE, _peer_listener)
+    atexit.register(stop_zeroconf)
+    print(f"[mDNS] Advertising as '{DEVICE_NAME}' at {mdns_hostname()}:{APP_PORT}")
+
+
+def stop_zeroconf() -> None:
+    global _zeroconf
+    if _zeroconf is not None:
+        try:
+            _zeroconf.close()
+        finally:
+            _zeroconf = None
+
+
+# --------------------------------------------------------------------------- #
+# Pushing a file to a peer (streamed, memory-safe for large files)            #
+# --------------------------------------------------------------------------- #
+
+
+def push_file_to_peer(peer_url: str, filepath: Path) -> tuple[int, str]:
+    """POST a local file to another LanShare device's /upload endpoint."""
+    boundary = uuid.uuid4().hex
+    filename = filepath.name
+    preamble = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    epilogue = f"\r\n--{boundary}--\r\n".encode()
+    size = filepath.stat().st_size
+    total = len(preamble) + size + len(epilogue)
+
+    parsed = urllib.parse.urlparse(peer_url)
+    conn = http.client.HTTPConnection(
+        parsed.hostname, parsed.port or APP_PORT, timeout=60
+    )
+    try:
+        conn.putrequest("POST", "/upload")
+        conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        conn.putheader("Content-Length", str(total))
+        conn.endheaders()
+        conn.send(preamble)
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        conn.send(epilogue)
+        resp = conn.getresponse()
+        body = resp.read().decode(errors="ignore")
+        return resp.status, body
+    finally:
+        conn.close()
+
+
 HTML = r"""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>LAN File Server</title>
+  <meta name="theme-color" content="#111827">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="LanShare">
+  <link rel="manifest" href="/manifest.json">
+  <title>LanShare — {{ device_name }}</title>
   <style>
     :root {
       --text: #111827;
@@ -106,6 +322,9 @@ HTML = r"""
       --danger-border: rgba(239, 68, 68, 0.18);
       --progress-bg: rgba(17, 24, 39, 0.08);
       --progress-fill: linear-gradient(90deg, #6b7280, #374151);
+      --ready: #16a34a;
+      --ready-bg: rgba(22, 163, 74, 0.10);
+      --ready-border: rgba(22, 163, 74, 0.22);
     }
 
     @media (prefers-color-scheme: dark) {
@@ -132,6 +351,9 @@ HTML = r"""
         --danger-border: rgba(248, 113, 113, 0.22);
         --progress-bg: rgba(255, 255, 255, 0.10);
         --progress-fill: linear-gradient(90deg, #d1d5db, #9ca3af);
+        --ready: #4ade80;
+        --ready-bg: rgba(74, 222, 128, 0.10);
+        --ready-border: rgba(74, 222, 128, 0.22);
       }
     }
 
@@ -197,6 +419,46 @@ HTML = r"""
         margin: 48px 0;
         padding: 48px;
       }
+    }
+
+    .ready-banner {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 24px;
+      border: 1px solid var(--ready-border);
+      background: var(--ready-bg);
+      border-radius: 20px;
+      padding: 16px 20px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .dot {
+      flex: none;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--ready);
+      box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.5);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.45); }
+      70% { box-shadow: 0 0 0 12px rgba(22, 163, 74, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0); }
+    }
+
+    .ready-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .ready-sub {
+      margin-top: 2px;
+      font-size: 0.9rem;
+      color: var(--muted);
     }
 
     .top {
@@ -407,12 +669,12 @@ HTML = r"""
     }
 
     .linkbox {
-      margin-top: 18px;
+      margin-top: 12px;
       border: 1px solid var(--panel-border);
       border-radius: 18px;
       background: rgba(17, 24, 39, 0.03);
-      padding: 14px 16px;
-      font-size: 0.95rem;
+      padding: 12px 14px;
+      font-size: 0.9rem;
       color: var(--muted);
       word-break: break-all;
     }
@@ -426,9 +688,19 @@ HTML = r"""
       text-decoration: underline;
     }
 
+    .link-label {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted-2);
+    }
+
     .phone-note {
       margin-top: 12px;
-      font-size: 0.94rem;
+      font-size: 0.9rem;
       line-height: 1.7;
       color: var(--muted);
     }
@@ -447,13 +719,15 @@ HTML = r"""
     }
 
     .upload-list,
-    .files {
+    .files,
+    .peers {
       display: grid;
       gap: 12px;
     }
 
     .upload-item,
-    .file-item {
+    .file-item,
+    .peer-item {
       border: 1px solid var(--panel-border);
       background: var(--panel-bg-2);
       border-radius: 24px;
@@ -520,10 +794,70 @@ HTML = r"""
       font-weight: 600;
     }
 
+    .ok-text {
+      color: var(--ready);
+      font-weight: 600;
+    }
+
     .file-actions {
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .peer-select {
+      appearance: none;
+      border: 1px solid var(--panel-border);
+      background: rgba(255, 255, 255, 0.35);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .peer-select {
+        background: rgba(255, 255, 255, 0.06);
+      }
+    }
+
+    .peer-dot {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--ready);
+      margin-right: 8px;
+    }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--btn-dark);
+      color: #fff;
+      padding: 12px 18px;
+      border-radius: 999px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      box-shadow: var(--shadow-md);
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.3s ease;
+      z-index: 50;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .toast { color: #111827; }
     }
 
     @media (max-width: 860px) {
@@ -554,11 +888,21 @@ HTML = r"""
 <body>
   <div class="wrap">
     <section class="shell">
+      <div class="ready-banner">
+        <span class="dot"></span>
+        <div>
+          <div class="ready-title">{{ device_name }} is ready</div>
+          <div class="ready-sub">Accepting and sharing files at the same time</div>
+        </div>
+      </div>
+
       <div class="top">
         <div class="panel">
-          <h1>LAN File Server</h1>
+          <h1>LanShare</h1>
           <p class="lead">
-            Drag files here from your PC or open this on your phone using the QR code.
+            Drop files here from this PC, open this page on your phone with the QR code,
+            or send a file straight to another device on the network below.
+            Works over Wi-Fi and over a direct Ethernet cable (no internet needed).
           </p>
 
           <div id="dropzone" class="dropzone">
@@ -576,23 +920,40 @@ HTML = r"""
         </div>
 
         <div class="panel qr-box">
-          <div class="eyebrow">Open on phone</div>
+          <div class="eyebrow">Open on another device</div>
 
           <div class="qr-wrap">
             <img src="/qr" alt="Server QR code">
           </div>
 
+          {% if mdns_url %}
           <div class="linkbox">
-            <a href="{{ access_url }}" target="_blank">{{ access_url }}</a>
+            <span class="link-label">By name (any platform)</span>
+            <a href="{{ mdns_url }}" target="_blank">{{ mdns_url }}</a>
           </div>
+          {% endif %}
+
+          {% for url in access_urls %}
+          <div class="linkbox">
+            <span class="link-label">{{ "Wired / link-local" if "169.254." in url else "By IP address" }}</span>
+            <a href="{{ url }}" target="_blank">{{ url }}</a>
+          </div>
+          {% endfor %}
 
           <p class="phone-note">
-            Make sure phone and PC are on the same Wi-Fi.
+            Same Wi-Fi, or an Ethernet cable between the two devices.
           </p>
         </div>
       </div>
 
       <div class="sections">
+        <div class="panel-soft">
+          <div class="section-title">Devices on this network</div>
+          <div id="peers" class="peers">
+            <div class="muted">Looking for other LanShare devices…</div>
+          </div>
+        </div>
+
         <div class="panel-soft">
           <div class="section-title">Uploads in progress</div>
           <div id="uploadList" class="upload-list">
@@ -608,12 +969,31 @@ HTML = r"""
     </section>
   </div>
 
+  <div id="toast" class="toast"></div>
+
   <script>
     const dropzone = document.getElementById("dropzone");
     const pickBtn = document.getElementById("pickBtn");
     const fileInput = document.getElementById("fileInput");
     const uploadList = document.getElementById("uploadList");
     const filesBox = document.getElementById("files");
+    const peersBox = document.getElementById("peers");
+    const toast = document.getElementById("toast");
+
+    let PEERS = [];
+
+    function showToast(msg) {
+      toast.textContent = msg;
+      toast.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => toast.classList.remove("show"), 2600);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
 
     function formatBytes(bytes) {
       if (bytes === 0) return "0 B";
@@ -667,7 +1047,7 @@ HTML = r"""
       el.innerHTML = `
         <div class="row">
           <div>
-            <div class="file-name">${file.name}</div>
+            <div class="file-name">${escapeHtml(file.name)}</div>
             <div class="file-meta">${formatBytes(file.size)}</div>
           </div>
         </div>
@@ -735,7 +1115,7 @@ HTML = r"""
           if (xhr.status >= 200 && xhr.status < 300) {
             bar.style.width = "100%";
             percent.textContent = "100%";
-            result.textContent = "Upload complete";
+            result.innerHTML = `<span class="ok-text">Upload complete</span>`;
           } else {
             result.innerHTML = `<span class="danger-text">Upload failed</span>`;
           }
@@ -760,6 +1140,75 @@ HTML = r"""
       });
     }
 
+    function peerOptionsHtml() {
+      if (!PEERS.length) {
+        return `<option value="" disabled selected>No devices found</option>`;
+      }
+      return `<option value="" disabled selected>Send to…</option>` +
+        PEERS.map(p => `<option value="${escapeHtml(p.url)}">${escapeHtml(p.name)}</option>`).join("");
+    }
+
+    async function loadPeers() {
+      try {
+        const res = await fetch("/api/peers");
+        const data = await res.json();
+        PEERS = data.peers || [];
+      } catch (e) {
+        PEERS = [];
+      }
+
+      if (!PEERS.length) {
+        peersBox.innerHTML = `<div class="muted">No other LanShare devices found yet. Open LanShare on another device on the same network.</div>`;
+        return;
+      }
+
+      peersBox.innerHTML = "";
+      for (const p of PEERS) {
+        const el = document.createElement("div");
+        el.className = "peer-item";
+        el.innerHTML = `
+          <div class="row">
+            <div>
+              <div class="file-name"><span class="peer-dot"></span>${escapeHtml(p.name)}</div>
+              <div class="file-meta">${escapeHtml(p.url)}</div>
+            </div>
+            <div class="file-actions">
+              <a class="btn btn-secondary" href="${escapeHtml(p.url)}" target="_blank">Open</a>
+            </div>
+          </div>
+        `;
+        peersBox.appendChild(el);
+      }
+    }
+
+    async function sendToPeer(filename, peerUrl, btn) {
+      if (!peerUrl) {
+        showToast("Pick a device first");
+        return;
+      }
+      const original = btn.textContent;
+      btn.textContent = "Sending…";
+      btn.disabled = true;
+      try {
+        const res = await fetch("/api/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename, peer: peerUrl })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          showToast(`Sent "${filename}"`);
+        } else {
+          showToast(data.error || "Send failed");
+        }
+      } catch (e) {
+        showToast("Send failed");
+      } finally {
+        btn.textContent = original;
+        btn.disabled = false;
+      }
+    }
+
     async function loadFiles() {
       const res = await fetch("/api/files");
       const data = await res.json();
@@ -776,55 +1225,121 @@ HTML = r"""
         item.innerHTML = `
           <div class="row">
             <div>
-              <div class="file-name">${file.name}</div>
+              <div class="file-name">${escapeHtml(file.name)}</div>
               <div class="file-meta">${file.size_h}</div>
             </div>
             <div class="file-actions">
               <a class="btn btn-primary" href="/files/${encodeURIComponent(file.name)}" target="_blank">Open</a>
               <a class="btn btn-secondary" href="/download/${encodeURIComponent(file.name)}">Download</a>
-              <button class="btn btn-danger" data-name="${file.name}">Delete</button>
+              <select class="peer-select">${peerOptionsHtml()}</select>
+              <button class="btn btn-secondary send-btn">Send</button>
+              <button class="btn btn-danger del-btn" data-name="${escapeHtml(file.name)}">Delete</button>
             </div>
           </div>
         `;
-        filesBox.appendChild(item);
-      }
 
-      document.querySelectorAll("button[data-name]").forEach(btn => {
-        btn.addEventListener("click", async () => {
-          const name = btn.getAttribute("data-name");
-          const ok = confirm(`Delete "${name}"?`);
-          if (!ok) return;
+        const select = item.querySelector(".peer-select");
+        const sendBtn = item.querySelector(".send-btn");
+        sendBtn.addEventListener("click", () => sendToPeer(file.name, select.value, sendBtn));
 
-          const res = await fetch("/delete/" + encodeURIComponent(name), {
-            method: "DELETE"
-          });
-
+        const delBtn = item.querySelector(".del-btn");
+        delBtn.addEventListener("click", async () => {
+          const name = delBtn.getAttribute("data-name");
+          if (!confirm(`Delete "${name}"?`)) return;
+          const res = await fetch("/delete/" + encodeURIComponent(name), { method: "DELETE" });
           if (res.ok) {
             loadFiles();
           } else {
-            alert("Failed to delete file");
+            showToast("Failed to delete file");
           }
         });
-      });
+
+        filesBox.appendChild(item);
+      }
     }
 
+    loadPeers();
     loadFiles();
     setInterval(loadFiles, 5000);
+    setInterval(loadPeers, 4000);
   </script>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def index():
-    ip = get_local_ip()
-    access_url = f"http://{ip}:{APP_PORT}"
-    return render_template_string(HTML, access_url=access_url)
+    return render_template_string(
+        HTML,
+        device_name=DEVICE_NAME,
+        access_urls=access_urls(),
+        mdns_url=f"http://{mdns_hostname()}:{APP_PORT}",
+    )
+
+
+@app.route("/health")
+def health():
+    return jsonify(
+        {
+            "status": "ready",
+            "name": DEVICE_NAME,
+            "id": INSTANCE_ID,
+            "addresses": get_all_ipv4(),
+            "port": APP_PORT,
+        }
+    )
+
+
+@app.route("/manifest.json")
+def manifest():
+    return jsonify(
+        {
+            "name": f"LanShare — {DEVICE_NAME}",
+            "short_name": "LanShare",
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#e5e7eb",
+            "theme_color": "#111827",
+            "icons": [],
+        }
+    )
 
 
 @app.route("/api/files")
 def api_files():
     return jsonify({"files": list_files()})
+
+
+@app.route("/api/peers")
+def api_peers():
+    return jsonify({"peers": _peer_listener.snapshot()})
+
+
+@app.route("/api/send", methods=["POST"])
+def api_send():
+    data = request.get_json(silent=True) or {}
+    filename = data.get("filename", "")
+    peer = data.get("peer", "")
+    if not filename or not peer:
+        return jsonify({"error": "filename and peer are required"}), 400
+
+    target = safe_join_uploads(filename)
+    if not target.exists() or not target.is_file():
+        return jsonify({"error": "File not found"}), 404
+
+    parsed = urllib.parse.urlparse(peer)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return jsonify({"error": "Invalid peer URL"}), 400
+
+    try:
+        status, _ = push_file_to_peer(peer, target)
+    except Exception as exc:
+        return jsonify({"error": f"Could not reach device: {exc}"}), 502
+
+    if 200 <= status < 300:
+        return jsonify({"ok": True})
+    return jsonify({"error": f"Device responded with {status}"}), 502
 
 
 @app.route("/upload", methods=["POST"])
@@ -840,13 +1355,7 @@ def upload():
     if not filename:
         return jsonify({"error": "Invalid filename"}), 400
 
-    target = UPLOAD_DIR / filename
-    if target.exists():
-        stem = target.stem
-        suffix = target.suffix
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        target = UPLOAD_DIR / f"{stem}-{timestamp}{suffix}"
-
+    target = unique_target(filename)
     file.save(target)
     return jsonify({"ok": True, "filename": target.name})
 
@@ -878,18 +1387,33 @@ def delete_file(filename: str):
 
 @app.route("/qr")
 def qr():
-    ip = get_local_ip()
-    access_url = f"http://{ip}:{APP_PORT}"
-
+    access_url = f"http://{get_primary_ip()}:{APP_PORT}"
     img = qrcode.make(access_url)
     img.save(QR_PATH)
     return send_file(QR_PATH, mimetype="image/png")
 
 
-if __name__ == "__main__":
-    ip = get_local_ip()
+def main() -> None:
+    ips = get_all_ipv4()
+    start_zeroconf()
+
+    print(f"Device:  {DEVICE_NAME}")
     print(f"Local:   http://127.0.0.1:{APP_PORT}")
-    print(f"LAN:     http://{ip}:{APP_PORT}")
+    print(f"By name: http://{mdns_hostname()}:{APP_PORT}")
+    for ip in ips:
+        kind = "wired/link-local" if ip.startswith("169.254.") else "lan"
+        print(f"Access:  http://{ip}:{APP_PORT}  ({kind})")
     print(f"Uploads: {UPLOAD_DIR.resolve()}")
-    print("Open the LAN URL on your phone if both devices are on the same Wi-Fi.")
-    app.run(host=APP_HOST, port=APP_PORT, debug=False)
+    print("Ready — accepting and sharing files. Open a URL above on another device.")
+
+    try:
+        from waitress import serve
+
+        serve(app, host=APP_HOST, port=APP_PORT, threads=8)
+    except ImportError:
+        print("[warn] waitress not installed; using Flask's threaded dev server.")
+        app.run(host=APP_HOST, port=APP_PORT, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()
